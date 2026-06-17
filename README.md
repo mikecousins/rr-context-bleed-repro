@@ -1,12 +1,17 @@
-# React Router middleware context bleeds across requests on Vercel
+# React Router middleware context — cross-request bleed harness (Vercel)
 
-Minimal reproduction of a **cross-request state bleed**: with React Router v7
-framework mode + `future.v8_middleware` + the `@vercel/react-router` adapter, a
-value written into the per-request `RouterContextProvider` by middleware can be
-read back by a **different** concurrent request's loader.
+Minimal harness investigating a suspected **cross-request state bleed**: with
+React Router v7 framework mode + `future.v8_middleware` + the
+`@vercel/react-router` adapter, the hypothesis is that a value written into the
+per-request `RouterContextProvider` by middleware could be read back by a
+**different** concurrent request's loader. In a real app that's a security issue —
+one signed-in user served another user's authenticated page.
 
-In a real app this is a security issue: it's how one signed-in user can be served
-another user's authenticated page.
+> **Status:** in our own testing this harness has **not** reproduced the bleed
+> yet (see [What we observed](#what-we-observed)). It's published so the React
+> Router / Vercel / Clerk teams can test the hypothesis under controlled load
+> (Fluid Compute concurrency, real load tooling). Reproduction may require
+> conditions a minimal harness doesn't hit — see the notes below.
 
 ## Why this matters for `@clerk/react-router`
 
@@ -66,26 +71,43 @@ Expected: `✅ No bleed observed`. React Router's own server builds a fresh
 > That's what pins the bug to the Vercel serverless runtime rather than the build
 > or the app code.
 
-## Run it on Vercel — bleeds (the bug)
+## Run it on Vercel
 
 ```bash
 npm i -g vercel
-vercel deploy --prod      # or push to a Vercel-connected git repo
-node scripts/hammer.mjs https://<your-deployment>.vercel.app 2000 100
+vercel deploy --prod      # or import the repo in the Vercel dashboard
+node scripts/hammer.mjs https://<your-deployment>.vercel.app 5000 100
 ```
 
-Expected: `❌ Context bled across requests` with `Bled: N (>0%)` and sample lines
-like:
+Hypothesis: if the serverless adapter reuses one `RouterContextProvider` across
+concurrent requests on a warm instance, a loader reads another request's value
+and you'll see `Bled: N (>0%)` with lines like:
 
 ```
-expected id=req-417-ab12cd34  but context held=req-significant-other-id
+expected id=req-417-ab12cd34  but context held=req-different-request
 ```
 
-Same code, same versions — the only change from the clean run is that requests
-are served by the Vercel serverless adapter instead of `react-router-serve`.
-Bleeds appear once concurrent requests land on the same warm instance, so drive
-enough traffic (a few thousand requests) and re-run if the first burst hits cold
-instances.
+**Confirm concurrency first.** The harness reports `Max concurrency on one
+instance` (from a module-level in-flight counter exposed via `/check`). A clean
+result is only meaningful if that number is **≥ 2** — otherwise no two requests
+ever overlapped on a shared instance and the test proved nothing. In-instance
+concurrency on Vercel requires **Fluid Compute** (concurrent invocations per
+instance); make sure it's enabled. Also note that aggressive load can trip
+Vercel's edge abuse-protection (HTTP 403), so prefer your own internal load
+tooling over an external hammer.
+
+## What we observed
+
+This harness did **not** reproduce a bleed in ~21,000 requests (concurrency up to
+250) before Vercel's edge abuse-protection rate-limited the external load
+generator, and we could not confirm in-instance concurrency was exercised. That
+is consistent with the code: React Router's own server (`react-router-serve`)
+builds a fresh context per request (verified clean at 2,000 req / concurrency
+100), and `@clerk/react-router`'s `clerkMiddleware` / `getAuth` / `clerkClient`
+are all request-scoped. So a minimal harness may be insufficient — reproducing
+the production bleed likely requires Fluid Compute in-instance concurrency and/or
+the real Clerk request path. This repo is a **starting harness** for testing the
+hypothesis under controlled conditions, not a confirmed reproduction.
 
 ## What a fix looks like
 
