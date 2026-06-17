@@ -1,6 +1,6 @@
 import { getAuth } from '@clerk/react-router/server';
 import type { Route } from './+types/check-clerk';
-import { getInstanceStats } from '../root';
+import { getInstanceStats } from '../instrument.server';
 
 // Decode the `sub` (Clerk user id) straight from this request's __session
 // cookie. This is the request's GROUND-TRUTH identity — it can't bleed, because

@@ -1,5 +1,5 @@
 import type { Route } from './+types/_index';
-import { requestIdContext } from '../root';
+import { requestIdContext } from '../instrument.server';
 
 export async function loader({ request, context }: Route.LoaderArgs) {
   const fromRequest = new URL(request.url).searchParams.get('id') ?? '<none>';

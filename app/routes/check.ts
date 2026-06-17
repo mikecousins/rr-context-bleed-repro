@@ -1,5 +1,5 @@
 import type { Route } from './+types/check';
-import { getInstanceStats, requestIdContext } from '../root';
+import { getInstanceStats, requestIdContext } from '../instrument.server';
 
 // `fromRequest` comes straight off this request's URL — always correct.
 // `fromContext` comes from the RR context that the root middleware set for this
