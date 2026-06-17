@@ -59,6 +59,13 @@ npm run hammer            # node scripts/hammer.mjs http://localhost:3000 1000 5
 Expected: `✅ No bleed observed`. React Router's own server builds a fresh
 `RouterContextProvider` for every request, so the context never leaks.
 
+> Note: `vercelPreset()` nests the server build under
+> `build/server/nodejs_.../index.js` (reflected in the `start` script). Serving
+> that **same build** with plain `react-router-serve` stays clean even under
+> heavy concurrency — verified here at 2000 requests / concurrency 100, 0 bleeds.
+> That's what pins the bug to the Vercel serverless runtime rather than the build
+> or the app code.
+
 ## Run it on Vercel — bleeds (the bug)
 
 ```bash
