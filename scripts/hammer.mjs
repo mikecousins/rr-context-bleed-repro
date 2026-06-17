@@ -21,7 +21,9 @@ const concurrency = Number(process.argv[4] || 50);
 let sent = 0;
 let bled = 0;
 let errors = 0;
+let maxConcurrentOnOneInstance = 0;
 const samples = [];
+const instances = new Set();
 
 async function one(i) {
   const id = `req-${i}-${Math.random().toString(36).slice(2, 10)}`;
@@ -30,6 +32,10 @@ async function one(i) {
       headers: { accept: 'application/json' },
     });
     const data = await res.json();
+    if (data.instanceId) instances.add(data.instanceId);
+    if (typeof data.maxInFlight === 'number' && data.maxInFlight > maxConcurrentOnOneInstance) {
+      maxConcurrentOnOneInstance = data.maxInFlight;
+    }
     if (data.bled) {
       bled++;
       if (samples.length < 10) {
@@ -55,6 +61,11 @@ async function run() {
   console.log(`\nBase URL:    ${base}`);
   console.log(`Requests:    ${sent} (concurrency ${concurrency})`);
   console.log(`Errors:      ${errors}`);
+  console.log(`Instances:   ${instances.size} distinct warm instance(s) served the load`);
+  console.log(`Max concurrency on one instance: ${maxConcurrentOnOneInstance}` +
+    (maxConcurrentOnOneInstance < 2
+      ? '  ⚠️  never >1 — no in-instance concurrency, so a clean result is INCONCLUSIVE'
+      : '  (real in-instance concurrency was exercised)'));
   console.log(`Bled:        ${bled}  (${sent ? ((bled / sent) * 100).toFixed(2) : '0'}%)`);
 
   if (samples.length) {

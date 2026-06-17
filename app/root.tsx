@@ -1,5 +1,15 @@
+import { randomUUID } from 'node:crypto';
 import { createContext, Links, Meta, Outlet, Scripts, ScrollRestoration } from 'react-router';
 import type { Route } from './+types/root';
+
+// Module-level (per warm instance) instrumentation, so the load test can PROVE
+// it actually exercised in-instance concurrency — otherwise a clean result is
+// meaningless. INSTANCE_ID is stable for the life of a warm instance; inFlight
+// counts requests executing concurrently on this instance right now.
+const INSTANCE_ID = randomUUID();
+let inFlight = 0;
+let maxInFlight = 0;
+export const getInstanceStats = () => ({ instanceId: INSTANCE_ID, maxInFlight });
 
 // A per-request value, written into the React Router context by middleware and
 // read back from a loader. This is exactly the pattern @clerk/react-router uses
@@ -22,8 +32,14 @@ export const middleware: Route.MiddlewareFunction[] = [
   async ({ request, context }, next) => {
     const id = new URL(request.url).searchParams.get('id') ?? '<none>';
     context.set(requestIdContext, id);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    return next();
+    inFlight += 1;
+    if (inFlight > maxInFlight) maxInFlight = inFlight;
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return await next();
+    } finally {
+      inFlight -= 1;
+    }
   },
 ];
 

@@ -1,5 +1,5 @@
 import type { Route } from './+types/check';
-import { requestIdContext } from '../root';
+import { getInstanceStats, requestIdContext } from '../root';
 
 // `fromRequest` comes straight off this request's URL — always correct.
 // `fromContext` comes from the RR context that the root middleware set for this
@@ -8,9 +8,10 @@ import { requestIdContext } from '../root';
 export async function loader({ request, context }: Route.LoaderArgs) {
   const fromRequest = new URL(request.url).searchParams.get('id') ?? '<none>';
   const fromContext = context.get(requestIdContext);
+  const { instanceId, maxInFlight } = getInstanceStats();
 
   return Response.json(
-    { fromRequest, fromContext, bled: fromRequest !== fromContext },
+    { fromRequest, fromContext, bled: fromRequest !== fromContext, instanceId, maxInFlight },
     { headers: { 'cache-control': 'no-store' } },
   );
 }
