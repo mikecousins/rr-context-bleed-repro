@@ -109,6 +109,48 @@ the production bleed likely requires Fluid Compute in-instance concurrency and/o
 the real Clerk request path. This repo is a **starting harness** for testing the
 hypothesis under controlled conditions, not a confirmed reproduction.
 
+## For the Clerk team: reproduce with real sessions
+
+`/check` (above) uses a plain string to isolate the framework. To exercise the
+**actual Clerk path**, set Clerk keys and hit `/check-clerk`, which mirrors
+production: `clerkMiddleware()` resolves the session and stores it in the RR
+context; the loader reads it back with `getAuth()` and compares the resulting
+`userId` against the `sub` decoded directly from the request's own `__session`
+cookie.
+
+1. Set env (clerkMiddleware activates only when present — see `.env.example`):
+
+   ```
+   CLERK_PUBLISHABLE_KEY=pk_...
+   CLERK_SECRET_KEY=sk_...
+   ```
+
+2. Mint two sessions for two different users; capture each `__session` cookie.
+
+3. Under load (Fluid Compute / your internal concurrency tooling), fire
+   concurrent requests to `/check-clerk`, alternating the two cookies:
+
+   ```
+   GET /check-clerk   Cookie: __session=<session A JWT>
+   GET /check-clerk   Cookie: __session=<session B JWT>
+   ```
+
+4. Each response self-reports — no external bookkeeping needed:
+
+   ```json
+   { "authUserId": "user_A", "cookieSub": "user_A", "bled": false,
+     "instanceId": "…", "maxInFlight": 3 }
+   ```
+
+   `bled: true` (`authUserId` != this request's own `cookieSub`) is the
+   cross-user bleed: `getAuth()` returned another request's identity. Confirm
+   `maxInFlight >= 2` so you know requests actually overlapped on a shared
+   instance.
+
+Exact production stack: `react-router` 7.17.0, `@vercel/react-router` 1.3.1,
+`@clerk/react-router` 3.1.5, `future.v8_middleware`, `vercelPreset()`, Node
+serverless.
+
 ## What a fix looks like
 
 Each request must get its own `RouterContextProvider`. Application code can

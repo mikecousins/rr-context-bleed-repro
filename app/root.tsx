@@ -1,6 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { createContext, Links, Meta, Outlet, Scripts, ScrollRestoration } from 'react-router';
+import { clerkMiddleware } from '@clerk/react-router/server';
 import type { Route } from './+types/root';
+
+// Clerk's middleware activates only when keys are present, so the plain `/check`
+// harness still runs without any Clerk setup. With keys, the app mirrors
+// production: clerkMiddleware resolves the session and stores it in the RR
+// context, and `/check-clerk` reads it back via getAuth.
+const clerkEnabled = Boolean(process.env.CLERK_SECRET_KEY && process.env.CLERK_PUBLISHABLE_KEY);
 
 // Module-level (per warm instance) instrumentation, so the load test can PROVE
 // it actually exercised in-instance concurrency — otherwise a clean result is
@@ -28,19 +35,24 @@ export const requestIdContext = createContext<string>('<none>');
 // real auth middleware makes (e.g. Clerk's authenticateRequest), which widens
 // the window in which a concurrent request sharing the same context can
 // overwrite the value before this request's loader reads it back.
+const probeMiddleware: Route.MiddlewareFunction = async ({ request, context }, next) => {
+  const id = new URL(request.url).searchParams.get('id') ?? '<none>';
+  context.set(requestIdContext, id);
+  inFlight += 1;
+  if (inFlight > maxInFlight) maxInFlight = inFlight;
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    return await next();
+  } finally {
+    inFlight -= 1;
+  }
+};
+
 export const middleware: Route.MiddlewareFunction[] = [
-  async ({ request, context }, next) => {
-    const id = new URL(request.url).searchParams.get('id') ?? '<none>';
-    context.set(requestIdContext, id);
-    inFlight += 1;
-    if (inFlight > maxInFlight) maxInFlight = inFlight;
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      return await next();
-    } finally {
-      inFlight -= 1;
-    }
-  },
+  probeMiddleware,
+  // Same position as production: Clerk resolves the session per request and
+  // stores it in the RR context for getAuth() to read back.
+  ...(clerkEnabled ? [clerkMiddleware()] : []),
 ];
 
 export function Layout({ children }: { children: React.ReactNode }) {
