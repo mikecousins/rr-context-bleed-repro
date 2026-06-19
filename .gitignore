@@ -1,6 +1,6 @@
-node_modules/
-/.react-router/
-/build/
-/.vercel/
+node_modules
+/build
+/.react-router
+/.vercel
 *.log
 .DS_Store

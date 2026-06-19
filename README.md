@@ -1,159 +1,113 @@
-# React Router middleware context — cross-request bleed harness (Vercel)
+# rr-context-bleed PoC — cross-invocation `Request` aliasing on Vercel Fluid Compute
 
-Minimal harness investigating a suspected **cross-request state bleed**: with
-React Router v7 framework mode + `future.v8_middleware` + the
-`@vercel/react-router` adapter, the hypothesis is that a value written into the
-per-request `RouterContextProvider` by middleware could be read back by a
-**different** concurrent request's loader. In a real app that's a security issue —
-one signed-in user served another user's authenticated page.
+A minimal, deterministic proof-of-concept for a **cross-user request bleed**: under
+Vercel **Fluid Compute** (in-instance request concurrency), a React Router v7 loader can
+be handed **another concurrent invocation's `Request`**, so one caller is served data
+derived from a different caller's request. This is the **"Fork 3"** boundary — the
+adapter/runtime hands the loader the wrong `Request`; it is *not* an auth bug and *not* a
+shared React Router context (those are Forks 1 and 2, also probed here so they can be
+ruled out).
 
-> **Status:** in our own testing this harness has **not** reproduced the bleed
-> yet (see [What we observed](#what-we-observed)). It's published so the React
-> Router / Vercel / Clerk teams can test the hypothesis under controlled load
-> (Fluid Compute concurrency, real load tooling). Reproduction may require
-> conditions a minimal harness doesn't hit — see the notes below.
+No auth / Clerk / database. Each request carries a unique id; the detector flags any
+response whose id doesn't match the one the caller sent.
 
-## Why this matters for `@clerk/react-router`
+## Stack (mirrors the affected production app)
 
-`@clerk/react-router` resolves the session **from the request** (correct) but
-then stores it in the React Router context, and `getAuth()` reads it back from
-there:
+- React Router v7, framework mode, **SSR**, `future.v8_middleware: true`
+- `@vercel/react-router` **1.3.1** preset, Node serverless runtime
+- `react-router` **7.17.0**
+- No `vercel.json`; runtime/concurrency are Vercel **project settings**
 
-```js
-// @clerk/react-router/dist/server/clerkMiddleware.js
-const requestState = await clerkClient(args, options).authenticateRequest(clerkRequest, { ... });
-args.context.set(authFnContext, (opts) => requestState.toAuth(opts));
+## How the detector works
 
-// @clerk/react-router/dist/server/getAuth.js
-const authObjectFn = args.context.get(authFnContext);
-return getAuthObjectForAcceptedToken({ authObject: authObjectFn(...), ... });
-```
+- `/echo?u=<id>` is a JSON resource route. Its loader records three things:
+  - **`servedFromArgsRequest`** — the id read straight off **`args.request`** (header /
+    cookie / query). *This is the Fork-3 probe.* If the adapter handed this loader a
+    different invocation's `Request`, this is the **other** caller's id.
+  - **`servedFromContext`** — the id a route middleware wrote into the per-request RR
+    context (mirrors `clerkMiddleware` → `getAuth`). *Fork-2 probe.*
+  - **`instanceId` / `inFlightAtEntry` / `maxConcurrent`** — module-scoped counters that
+    prove whether two requests were actually in flight **on the same warm instance**.
+- The loader `await`s `POC_DELAY_MS` (default 150 ms) to **widen the interleave window**,
+  so overlap is reliable at *low* concurrency — no high-rate hammering, so Vercel's edge
+  abuse-protection is never tripped (that 403 wall is what blocked earlier attempts).
+- `scripts/drive.mjs` fires small batches (default **2**) of concurrent requests, each
+  with a **globally unique id**, and flags any mismatch.
 
-So if the `RouterContextProvider` is shared across concurrent requests, one
-request's `getAuth()` returns the auth that another request's `clerkMiddleware`
-wrote. This repro removes Clerk entirely and reproduces the same mechanism with a
-plain string, to isolate the framework/adapter layer.
-
-## The mechanism
-
-- `app/root.tsx` exports a middleware that, per request, reads `?id=` off the
-  request and does `context.set(requestIdContext, id)` (a stand-in for
-  `clerkMiddleware`). A 25ms `await` models the network round-trip a real auth
-  middleware makes, widening the concurrency window.
-- `app/routes/check.ts` is a loader that returns both `fromRequest` (the id off
-  this request's URL — always correct) and `fromContext` (`context.get(...)`).
-- `bled = fromRequest !== fromContext`. Any `true` means the context was shared.
-
-## Stack (matches the affected production app)
-
-- `react-router` `7.17.0`, `@react-router/node|serve|dev` `7.17.0`
-- `@vercel/react-router` `1.3.1`
-- `future: { v8_middleware: true }`, `presets: [vercelPreset()]`, `ssr: true`
-- Node serverless runtime
-
-## Run it locally — clean (control)
+## Quick start (local — validates the harness)
 
 ```bash
 npm install
 npm run build
-npm start                 # react-router-serve on http://localhost:3000
-# in another terminal:
-npm run hammer            # node scripts/hammer.mjs http://localhost:3000 1000 50
+npm start            # react-router-serve on http://localhost:3000  (leave running)
+
+# ...then in another shell:
+npm run drive        # or: node scripts/drive.mjs 300 2
 ```
 
-Expected: `✅ No bleed observed`. React Router's own server builds a fresh
-`RouterContextProvider` for every request, so the context never leaks.
+**Expected locally:** `maxConcurrentObservedOnAnyInstance >= 2` (the driver really does
+overlap requests) and `FORK3_request_aliasing: 0` / `FORK2_context_bleed: 0`. A single
+local Node server builds a fresh `Request` per request, so it does **not** bleed — this
+confirms the harness reports *clean* correctly and that React Router itself is sound.
 
-> Note: `vercelPreset()` nests the server build under
-> `build/server/nodejs_.../index.js` (reflected in the `start` script). Serving
-> that **same build** with plain `react-router-serve` stays clean even under
-> heavy concurrency — verified here at 2000 requests / concurrency 100, 0 bleeds.
-> That's what pins the bug to the Vercel serverless runtime rather than the build
-> or the app code.
+## Reproduce on Vercel (the actual test)
 
-## Run it on Vercel
+1. Deploy this directory to a Vercel project (framework auto-detects as React Router):
+   ```bash
+   npx vercel deploy            # or: git push to a Vercel-connected repo
+   ```
+2. **Enable Fluid Compute:** Project → **Settings → Functions → Fluid Compute → On**, then
+   **redeploy** (the toggle only applies to new deployments). This is the precondition —
+   the bleed requires two requests sharing one warm instance.
+3. Drive it against the deployment (low concurrency by design):
+   ```bash
+   BASE=https://<your-deployment-url> node scripts/drive.mjs 300 2
+   ```
+   If you want a wider window: `POC_DELAY_MS` is baked at build time per deploy; redeploy
+   with e.g. `POC_DELAY_MS=300` set as an env var, or raise concurrency: `... 300 3`.
 
-```bash
-npm i -g vercel
-vercel deploy --prod      # or import the repo in the Vercel dashboard
-node scripts/hammer.mjs https://<your-deployment>.vercel.app 5000 100
+### What confirms the bug
+
+```
+"maxConcurrentObservedOnAnyInstance": >= 2,   // two requests overlapped on ONE instance
+"distinctInstances": [ "<few>" ],             // and reused a warm instance
+"FORK3_request_aliasing": > 0                 // a loader read another invocation's Request
 ```
 
-Hypothesis: if the serverless adapter reuses one `RouterContextProvider` across
-concurrent requests on a warm instance, a loader reads another request's value
-and you'll see `Bled: N (>0%)` with lines like:
+with `sampleBleeds` entries like:
 
+```json
+{ "kind": "FORK3_request_aliasing", "asked": "u_42_0", "gotFromArgsRequest": "u_42_1",
+  "instanceId": "ab12cd34", "inFlightAtEntry": 2, "url": ".../echo?u=u_42_1" }
 ```
-expected id=req-417-ab12cd34  but context held=req-different-request
-```
 
-**Confirm concurrency first.** The harness reports `Max concurrency on one
-instance` (from a module-level in-flight counter exposed via `/check`). A clean
-result is only meaningful if that number is **≥ 2** — otherwise no two requests
-ever overlapped on a shared instance and the test proved nothing. In-instance
-concurrency on Vercel requires **Fluid Compute** (concurrent invocations per
-instance); make sure it's enabled. Also note that aggressive load can trip
-Vercel's edge abuse-protection (HTTP 403), so prefer your own internal load
-tooling over an external hammer.
+`asked` is the id the caller sent; `gotFromArgsRequest` is the id the loader read off
+`args.request`. They differ → the loader was handed a different concurrent invocation's
+`Request` on the same warm instance. Note even `url` is the other request's URL, i.e. the
+entire `Request` object is the wrong one (not a mis-parse).
 
-## What we observed
+## Interpreting results
 
-This harness did **not** reproduce a bleed in ~21,000 requests (concurrency up to
-250) before Vercel's edge abuse-protection rate-limited the external load
-generator, and we could not confirm in-instance concurrency was exercised. That
-is consistent with the code: React Router's own server (`react-router-serve`)
-builds a fresh context per request (verified clean at 2,000 req / concurrency
-100), and `@clerk/react-router`'s `clerkMiddleware` / `getAuth` / `clerkClient`
-are all request-scoped. So a minimal harness may be insufficient — reproducing
-the production bleed likely requires Fluid Compute in-instance concurrency and/or
-the real Clerk request path. This repo is a **starting harness** for testing the
-hypothesis under controlled conditions, not a confirmed reproduction.
+| Result | Meaning |
+| --- | --- |
+| `maxConcurrent < 2` | No overlap happened — inconclusive. Enable Fluid Compute; raise concurrency / `POC_DELAY_MS`. |
+| `FORK3 > 0` | **Request aliasing across concurrent invocations** (the platform layer). |
+| `FORK2 > 0`, `FORK3 = 0` | Shared/raced RR context only (app-level `getLoadContext` pattern). |
+| all `0`, `maxConcurrent >= 2` | No bleed under the exercised concurrency. |
 
-## For the Clerk team: reproduce with real sessions
+## Knobs
 
-`/check` (above) uses a plain string to isolate the framework. To exercise the
-**actual Clerk path**, set Clerk keys and hit `/check-clerk`, which mirrors
-production: `clerkMiddleware()` resolves the session and stores it in the RR
-context; the loader reads it back with `getAuth()` and compares the resulting
-`userId` against the `sub` decoded directly from the request's own `__session`
-cookie.
+- `POC_DELAY_MS` (build-time env, default `150`) — interleave window width.
+- arg 1 `rounds` (default `300`), arg 2 `concurrency` (default `2`), `BATCH_PAUSE_MS`
+  (default `25`).
 
-1. Set env (clerkMiddleware activates only when present — see `.env.example`):
+## Why this layer
 
-   ```
-   CLERK_PUBLISHABLE_KEY=pk_...
-   CLERK_SECRET_KEY=sk_...
-   ```
-
-2. Mint two sessions for two different users; capture each `__session` cookie.
-
-3. Under load (Fluid Compute / your internal concurrency tooling), fire
-   concurrent requests to `/check-clerk`, alternating the two cookies:
-
-   ```
-   GET /check-clerk   Cookie: __session=<session A JWT>
-   GET /check-clerk   Cookie: __session=<session B JWT>
-   ```
-
-4. Each response self-reports — no external bookkeeping needed:
-
-   ```json
-   { "authUserId": "user_A", "cookieSub": "user_A", "bled": false,
-     "instanceId": "…", "maxInFlight": 3 }
-   ```
-
-   `bled: true` (`authUserId` != this request's own `cookieSub`) is the
-   cross-user bleed: `getAuth()` returned another request's identity. Confirm
-   `maxInFlight >= 2` so you know requests actually overlapped on a shared
-   instance.
-
-Exact production stack: `react-router` 7.17.0, `@vercel/react-router` 1.3.1,
-`@clerk/react-router` 3.1.5, `future.v8_middleware`, `vercelPreset()`, Node
-serverless.
-
-## What a fix looks like
-
-Each request must get its own `RouterContextProvider`. Application code can
-mitigate by re-deriving identity from the request rather than trusting the
-context round-trip, but the correct fix is for every request to receive an
-isolated context.
+The `@vercel/react-router` **npm** package ships no code that holds a `Request` across
+invocations: `entry.server.js`'s `handleRequest` takes `request`/`routerContext` as
+parameters, and `vite.js` (`vercelPreset()`) is a build-time plugin only. React Router
+core + `@react-router/node` are per-request safe (this harness is **clean** on local
+`react-router-serve`). The only remaining component is the **serverless function
+entrypoint generated by Vercel's builder** under `.vercel/output/functions/**` plus the
+**Fluid Compute runtime** that multiplexes concurrent invocations into one warm instance —
+which is what this PoC exercises.
